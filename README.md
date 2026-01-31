@@ -24,7 +24,7 @@ This plugin sends daily updates to the Letterboxd diary informing the films watc
 2. Click the `+` button and add the repository URL below, naming it whatever you like and save.
 
 ```
-https://raw.githubusercontent.com/Gizmo091/jellyfin-plugin-letterboxd-sync/master/manifest.json
+https://raw.githubusercontent.com/hrqmonteiro/jellyfin-plugin-letterboxd-sync/master/manifest.json
 ```
 
 3. Go back to `Catalog`, click on 'LetterboxdSync' at 'General' group and install the most recent version.
