@@ -331,34 +331,53 @@ public class LetterboxdApi : IDisposable
     {
         string url = "/s/save-diary-entry";
         DateTime viewingDate = date == null ? DateTime.Now : (DateTime)date;
+        var viewingDateStr = viewingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        var tagsValue = date != null && tags.Length > 0 && tags.Any(t => !string.IsNullOrWhiteSpace(t))
+            ? "[\"" + string.Join("\",\"", tags.Where(t => !string.IsNullOrWhiteSpace(t))) + "\"]"
+            : string.Empty;
+        var viewingableUid = "film:" + filmId;
+
+        Dictionary<string, string>? formData = null;
 
         for (int attempt = 0; attempt < 2; attempt++)
         {
-            // IMPORTANT: Refresh CSRF from the film page (scoped token).
-            await RefreshCsrfCookieAsync().ConfigureAwait(false);
+            if (attempt > 0)
+                await Task.Delay(1000 + Random.Shared.Next(0, 501)).ConfigureAwait(false);
+
+            if (attempt == 0)
+            {
+                var html = await client.GetStringAsync($"/film/{filmSlug}/").ConfigureAwait(false);
+                var csrfFromPage = ExtractHiddenInput(html, "__csrf");
+                if (!string.IsNullOrWhiteSpace(csrfFromPage))
+                    this.csrf = csrfFromPage;
+            }
+
+            // Match browser form: viewingableUid and viewingableUID (both) = "film:{filmId}", tags = "" when no tags.
+            // Use Ordinal comparer so both viewingableUid and viewingableUID are sent (case-sensitive keys).
+            formData = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                { "json", "true" },
+                { "__csrf", this.csrf },
+                { "viewingId", string.Empty },
+                { "viewingableUid", viewingableUid },
+                { "viewingableUID", viewingableUid },
+                { "specifiedDate", date == null ? "false" : "true" },
+                { "viewingDateStr", viewingDateStr },
+                { "review", string.Empty },
+                { "tags", tagsValue },
+                { "rating", "0" },
+                { "liked", liked.ToString().ToLowerInvariant() },
+                { "filmId", filmId },
+            };
 
             using (var request = new HttpRequestMessage(HttpMethod.Post, url))
             {
-                // Make the request look like the browser flow for this action
                 request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
                 request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
                 request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
                 request.Headers.Accept.Clear();
                 request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
-                request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
-                {
-                    { "__csrf", this.csrf },
-                    { "json", "true" },
-                    { "viewingId", string.Empty },
-                    { "filmId", filmId },
-                    { "specifiedDate", date == null ? "false" : "true" },
-                    { "viewingDateStr", viewingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) },
-                    { "review", string.Empty },
-                    { "tags", date != null && tags.Length > 0 ? $"[{string.Join(",", tags)}]" : string.Empty },
-                    { "rating", "0" },
-                    { "liked", liked.ToString().ToLowerInvariant() } // some endpoints are picky about casing
-                });
+                request.Content = new FormUrlEncodedContent(formData);
 
                 using (var response = await client.SendAsync(request).ConfigureAwait(false))
                 {
@@ -371,7 +390,6 @@ public class LetterboxdApi : IDisposable
                     {
                         var json = doc.RootElement;
 
-                        // If response includes rotated CSRF, keep it
                         if (json.TryGetProperty("csrf", out var csrfEl) && csrfEl.ValueKind == JsonValueKind.String)
                         {
                             var newCsrf = csrfEl.GetString();
@@ -382,9 +400,13 @@ public class LetterboxdApi : IDisposable
                         if (SuccessOperation(json, out string message))
                             return;
 
-                        // Retry once on "expired"
-                        if (attempt == 0 &&
-                            message.Contains("expired", StringComparison.OrdinalIgnoreCase))
+                        bool hasFormInvalid = json.TryGetProperty("errorCodes", out var codes) &&
+                            codes.EnumerateArray().Any(c => c.ValueKind == JsonValueKind.String && c.GetString() == "form.invalid");
+                        bool canRetry = hasFormInvalid
+                            || message.Contains("expired", StringComparison.OrdinalIgnoreCase)
+                            || message.Contains("could not be processed", StringComparison.OrdinalIgnoreCase)
+                            || message.Contains("try again", StringComparison.OrdinalIgnoreCase);
+                        if (attempt == 0 && canRetry)
                         {
                             continue;
                         }
