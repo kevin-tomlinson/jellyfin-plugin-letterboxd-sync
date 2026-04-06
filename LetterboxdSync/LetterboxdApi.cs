@@ -309,17 +309,23 @@ public class LetterboxdApi : IDisposable
                 var filmDoc = new HtmlDocument();
                 filmDoc.LoadHtml(filmHtml);
 
-                HtmlNode? elForId =
-                    filmDoc.DocumentNode.SelectSingleNode($"//div[@data-film-slug='{filmSlug}']") ??
-                    filmDoc.DocumentNode.SelectSingleNode($"//div[@data-item-link='/film/{filmSlug}/']") ??
-                    filmDoc.DocumentNode.SelectSingleNode("//div[@data-film-id]");
-
-                if (elForId == null)
-                    throw new Exception("The search returned no results (No html element found to get letterboxd filmId)");
-
-                string filmId = elForId.GetAttributeValue("data-film-id", string.Empty);
+                // Extract productionId from analytics script: analytic_params['film_id'] = 'XXXX'
+                string filmId = string.Empty;
+                var scriptNodes = filmDoc.DocumentNode.SelectNodes("//script[not(@src)]");
+                if (scriptNodes != null)
+                {
+                    foreach (var script in scriptNodes)
+                    {
+                        var m = Regex.Match(script.InnerText, @"analytic_params\['film_id'\]\s*=\s*'([^']+)'");
+                        if (m.Success)
+                        {
+                            filmId = m.Groups[1].Value;
+                            break;
+                        }
+                    }
+                }
                 if (string.IsNullOrEmpty(filmId))
-                    throw new Exception("The search returned no results (data-film-id attribute is empty)");
+                    throw new Exception("The search returned no results (Could not extract film_id from analytics script)");
 
                 return new FilmResult(filmSlug, filmId);
             }
@@ -329,95 +335,49 @@ public class LetterboxdApi : IDisposable
 
     public async Task MarkAsWatched(string filmSlug, string filmId, DateTime? date, string[] tags, bool liked = false)
     {
-        string url = "/s/save-diary-entry";
+        string url = "/api/v0/production-log-entries";
         DateTime viewingDate = date == null ? DateTime.Now : (DateTime)date;
         var viewingDateStr = viewingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        var tagsValue = date != null && tags.Length > 0 && tags.Any(t => !string.IsNullOrWhiteSpace(t))
-            ? "[\"" + string.Join("\",\"", tags.Where(t => !string.IsNullOrWhiteSpace(t))) + "\"]"
-            : string.Empty;
-        var viewingableUid = "film:" + filmId;
+        var filteredTags = tags.Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
 
-        Dictionary<string, string>? formData = null;
-
-        for (int attempt = 0; attempt < 2; attempt++)
+        var payload = JsonSerializer.Serialize(new
         {
-            if (attempt > 0)
-                await Task.Delay(1000 + Random.Shared.Next(0, 501)).ConfigureAwait(false);
-
-            if (attempt == 0)
+            productionId = filmId,
+            diaryDetails = new
             {
-                var html = await client.GetStringAsync($"/film/{filmSlug}/").ConfigureAwait(false);
-                var csrfFromPage = ExtractHiddenInput(html, "__csrf");
-                if (!string.IsNullOrWhiteSpace(csrfFromPage))
-                    this.csrf = csrfFromPage;
-            }
+                diaryDate = viewingDateStr,
+                rewatch = false
+            },
+            tags = filteredTags,
+            like = liked
+        });
 
-            // Match browser form: viewingableUid and viewingableUID (both) = "film:{filmId}", tags = "" when no tags.
-            // Use Ordinal comparer so both viewingableUid and viewingableUID are sent (case-sensitive keys).
-            formData = new Dictionary<string, string>(StringComparer.Ordinal)
+        // Fetch film page to ensure CSRF cookie is fresh, then read it from the cookie jar
+        await client.GetStringAsync($"/film/{filmSlug}/").ConfigureAwait(false);
+        var cookieCsrf = GetCsrfFromCookie();
+        if (!string.IsNullOrWhiteSpace(cookieCsrf))
+            this.csrf = cookieCsrf;
+
+        using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+        {
+            request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
+            request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
+            request.Headers.TryAddWithoutValidation("X-CSRF-Token", this.csrf);
+            request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+            using (var response = await client.SendAsync(request).ConfigureAwait(false))
             {
-                { "json", "true" },
-                { "__csrf", this.csrf },
-                { "viewingId", string.Empty },
-                { "viewingableUid", viewingableUid },
-                { "viewingableUID", viewingableUid },
-                { "specifiedDate", date == null ? "false" : "true" },
-                { "viewingDateStr", viewingDateStr },
-                { "review", string.Empty },
-                { "tags", tagsValue },
-                { "rating", "0" },
-                { "liked", liked.ToString().ToLowerInvariant() },
-                { "filmId", filmId },
-            };
-
-            using (var request = new HttpRequestMessage(HttpMethod.Post, url))
-            {
-                request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
-                request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
-                request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
-                request.Headers.Accept.Clear();
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                request.Content = new FormUrlEncodedContent(formData);
-
-                using (var response = await client.SendAsync(request).ConfigureAwait(false))
+                if (!response.IsSuccessStatusCode)
                 {
-                    if (response.StatusCode != HttpStatusCode.OK)
-                        throw new Exception($"Letterboxd returned {(int)response.StatusCode}");
-
-                    var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-
-                    using (JsonDocument doc = JsonDocument.Parse(body))
-                    {
-                        var json = doc.RootElement;
-
-                        if (json.TryGetProperty("csrf", out var csrfEl) && csrfEl.ValueKind == JsonValueKind.String)
-                        {
-                            var newCsrf = csrfEl.GetString();
-                            if (!string.IsNullOrWhiteSpace(newCsrf))
-                                this.csrf = newCsrf!;
-                        }
-
-                        if (SuccessOperation(json, out string message))
-                            return;
-
-                        bool hasFormInvalid = json.TryGetProperty("errorCodes", out var codes) &&
-                            codes.EnumerateArray().Any(c => c.ValueKind == JsonValueKind.String && c.GetString() == "form.invalid");
-                        bool canRetry = hasFormInvalid
-                            || message.Contains("expired", StringComparison.OrdinalIgnoreCase)
-                            || message.Contains("could not be processed", StringComparison.OrdinalIgnoreCase)
-                            || message.Contains("try again", StringComparison.OrdinalIgnoreCase);
-                        if (attempt == 0 && canRetry)
-                        {
-                            continue;
-                        }
-
-                        throw new Exception(message);
-                    }
+                    var errorBody = string.Empty;
+                    try { errorBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false); } catch { }
+                    var detail = IsCloudflareChallenge(errorBody)
+                        ? " (Cloudflare challenge detected)"
+                        : $" — body: {errorBody.Substring(0, Math.Min(errorBody.Length, 300))}";
+                    throw new Exception($"Letterboxd returned {(int)response.StatusCode}{detail}");
                 }
             }
         }
-
-        throw new Exception("Failed to submit diary entry after retry.");
     }
 
 
