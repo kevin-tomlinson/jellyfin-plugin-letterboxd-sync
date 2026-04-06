@@ -23,6 +23,14 @@
     "imageUrl": "https://raw.githubusercontent.com/kevin-tomlinson/jellyfin-plugin-letterboxd-sync/master/images/letterboxd-sync.png",
     "versions": [
       {
+        "version": "1.2.0.0",
+        "changelog": "- feat: update api endpoint (84f8e86)",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/kevin-tomlinson/jellyfin-plugin-letterboxd-sync/releases/download/v1.2.0/jellyfin-plugin-letterboxd-sync-v1.2.0.zip",
+        "checksum": "e059c8bb2fe8338f1c9bb6587fdf5f7f",
+        "timestamp": "2026-04-06T19:01:56Z"
+      },
+      {
         "version": "1.1.9.0",
         "changelog": "",
         "targetAbi": "10.11.0.0",
